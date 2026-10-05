@@ -326,6 +326,14 @@ it('returns the incremented value on a subsequent increment (file driver)', func
     expect($this->driver->increment('counter', 60))->toBe(2);
 });
 
+it('returns an int from get() after increment() (file driver)', function (): void {
+    $this->driver->increment('counter', 60);
+    $this->driver->increment('counter', 60);
+
+    expect($this->driver->get('counter'))->toBe(2)
+        ->and($this->driver->getItem('counter')->get())->toBe(2);
+});
+
 it('applies the ttl on the first increment so the counter expires (file driver)', function (): void {
     $this->driver->increment('counter', 60);
 
