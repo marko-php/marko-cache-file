@@ -230,13 +230,19 @@ readonly class FileCacheDriver implements CacheInterface
         $this->ensureDirectoryExists();
 
         $filePath = $this->getFilePath($key);
-        $fh = fopen($filePath, 'c+');
+        // Never fail open: a counter that silently restarts at 1 on every call
+        // would let a rate limiter allow every request.
+        $fh = ErrorCapture::run($reason, fn (): mixed => fopen($filePath, 'c+'));
 
-        if ($fh === false) {
-            return 1;
+        if (!is_resource($fh)) {
+            throw FileCacheException::openFailed($filePath, $reason);
         }
 
-        flock($fh, LOCK_EX);
+        if (!ErrorCapture::run($reason, fn (): bool => flock($fh, LOCK_EX))) {
+            fclose($fh);
+
+            throw FileCacheException::lockFailed($filePath, $reason);
+        }
 
         try {
             $content = stream_get_contents($fh);
@@ -263,9 +269,14 @@ readonly class FileCacheDriver implements CacheInterface
 
             $envelope = $this->cacheValueSigner->wrap(serialize($data));
 
-            ftruncate($fh, 0);
-            rewind($fh);
-            fwrite($fh, $envelope);
+            $written = ErrorCapture::run(
+                $reason,
+                fn (): int|false => ftruncate($fh, 0) && rewind($fh) ? fwrite($fh, $envelope) : false,
+            );
+
+            if ($written !== strlen($envelope)) {
+                throw FileCacheException::writeFailed($filePath, $reason);
+            }
         } finally {
             flock($fh, LOCK_UN);
             fclose($fh);

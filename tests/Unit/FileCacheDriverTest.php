@@ -439,6 +439,25 @@ it(
     },
 );
 
+it('throws a CacheException instead of failing open when increment cannot open the counter file', function (): void {
+    mkdir($this->cachePath, 0755, true);
+    $targetPath = cacheEntryPath($this->cachePath, 'counter');
+
+    // A directory where the counter file should be makes fopen() fail
+    mkdir($targetPath, 0755, true);
+
+    try {
+        $this->driver->increment('counter', 60);
+        $this->fail('Expected FileCacheException');
+    } catch (FileCacheException $e) {
+        expect($e)->toBeInstanceOf(CacheException::class)
+            ->and($e->getMessage())->toBe("Cache entry could not be opened: $targetPath")
+            ->and($e->getContext())->toContain('fopen(');
+    } finally {
+        rmdir($targetPath);
+    }
+});
+
 it('removes leftover tmp files when clear is called', function (): void {
     mkdir($this->cachePath, 0755, true);
 

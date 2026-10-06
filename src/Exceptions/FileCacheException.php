@@ -30,6 +30,28 @@ class FileCacheException extends CacheException
         );
     }
 
+    public static function openFailed(
+        string $path,
+        ?string $reason = null,
+    ): self {
+        return new self(
+            message: "Cache entry could not be opened: $path",
+            context: self::withReason("While opening the cache entry '$path' to increment it", $reason),
+            suggestion: "Ensure the cache directory is writable by the web server or CLI user, has free space, and that '$path' is not a directory",
+        );
+    }
+
+    public static function lockFailed(
+        string $path,
+        ?string $reason = null,
+    ): self {
+        return new self(
+            message: "Cache entry could not be locked: $path",
+            context: self::withReason("While locking the cache entry '$path' to increment it", $reason),
+            suggestion: 'Ensure the cache directory is on a filesystem that supports flock() (local disk rather than some network mounts), or use a cache driver with native atomic increments such as marko/cache-redis',
+        );
+    }
+
     private static function withReason(
         string $context,
         ?string $reason,
