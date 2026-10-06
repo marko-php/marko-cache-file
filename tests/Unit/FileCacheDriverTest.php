@@ -7,8 +7,11 @@ use Marko\Cache\Contracts\CacheInterface;
 use Marko\Cache\Contracts\CacheItemInterface;
 use Marko\Cache\Exceptions\CacheException;
 use Marko\Cache\Exceptions\InvalidKeyException;
+use Marko\Cache\Exceptions\TamperedCacheValueException;
 use Marko\Cache\File\Driver\FileCacheDriver;
 use Marko\Cache\File\Exceptions\FileCacheException;
+use Marko\Cache\Signer\CacheValueSigner;
+use Marko\Encryption\Config\EncryptionConfig;
 use Marko\Testing\Fake\FakeClock;
 use Marko\Testing\Fake\FakeConfigRepository;
 
@@ -31,6 +34,14 @@ function cleanupCacheTestPath(
         }
     }
     rmdir($path);
+}
+
+function createTestCacheSigner(
+    string $key = 'file-cache-test-signing-key',
+): CacheValueSigner {
+    return new CacheValueSigner(new EncryptionConfig(new FakeConfigRepository([
+        'encryption.key' => $key,
+    ])));
 }
 
 function createTestCacheConfig(
@@ -66,14 +77,15 @@ function writeExpiredCacheEntry(
         'created_at' => $now - 20,
     ];
 
-    file_put_contents($filePath, serialize($data));
+    file_put_contents($filePath, createTestCacheSigner()->wrap(serialize($data)));
 }
 
 beforeEach(function (): void {
     $this->cachePath = getCacheTestPath();
     $this->config = createTestCacheConfig($this->cachePath);
     $this->clock = new FakeClock('2026-01-01 12:00:00 UTC');
-    $this->driver = new FileCacheDriver($this->config, $this->clock);
+    $this->signer = createTestCacheSigner();
+    $this->driver = new FileCacheDriver($this->config, $this->clock, $this->signer);
 });
 
 afterEach(function (): void {
@@ -192,7 +204,7 @@ it('does not expire items with zero ttl', function (): void {
 it('uses default ttl when not specified', function (): void {
     $cachePath = getCacheTestPath();
     $config = createTestCacheConfig($cachePath, 30);
-    $driver = new FileCacheDriver($config, $this->clock);
+    $driver = new FileCacheDriver($config, $this->clock, createTestCacheSigner());
     $driver->set('key', 'value');
 
     $this->clock->travel('+30 seconds');
@@ -293,7 +305,7 @@ it('throws exception for key with invalid characters', function (): void {
 it('creates cache directory if not exists', function (): void {
     $newPath = sys_get_temp_dir() . '/marko-cache-new-' . bin2hex(random_bytes(8));
     $config = createTestCacheConfig($newPath);
-    $driver = new FileCacheDriver($config, $this->clock);
+    $driver = new FileCacheDriver($config, $this->clock, createTestCacheSigner());
 
     $driver->set('key', 'value');
 
@@ -394,7 +406,7 @@ it('treats a file cache entry that decodes to an unexpected shape as a miss', fu
     }
 
     // Write a serialized payload that is valid PHP but has the wrong shape (no 'value' key)
-    file_put_contents($filePath, serialize(['corrupt' => 'data']));
+    file_put_contents($filePath, $this->signer->wrap(serialize(['corrupt' => 'data'])));
 
     expect($this->driver->get('key'))->toBeNull()
         ->and($this->driver->has('key'))->toBeFalse();
@@ -479,7 +491,7 @@ it('throws FileCacheException with the OS reason when the cache directory cannot
     $blocker = $this->cachePath . '/not-a-directory';
     file_put_contents($blocker, 'x');
 
-    $driver = new FileCacheDriver(createTestCacheConfig($blocker . '/cache'), $this->clock);
+    $driver = new FileCacheDriver(createTestCacheConfig($blocker . '/cache'), $this->clock, $this->signer);
 
     try {
         $driver->set('key', 'value');
@@ -517,7 +529,9 @@ function readCacheFileEntry(
     string $cachePath,
     string $key,
 ): array {
-    return unserialize(file_get_contents($cachePath . '/' . hash('xxh128', $key) . '.cache'));
+    $envelope = file_get_contents($cachePath . '/' . hash('xxh128', $key) . '.cache');
+
+    return unserialize(createTestCacheSigner()->verifyAndUnwrap($envelope));
 }
 
 it('keeps an entry until its ttl has elapsed on the clock', function (): void {
@@ -577,4 +591,118 @@ it('keeps counting within the window without moving the expiry', function (): vo
 
     expect($this->driver->increment('counter', 60))->toBe(2)
         ->and(readCacheFileEntry($this->cachePath, 'counter')['expires_at'])->toBe($expiresAt);
+});
+
+function cacheEntryPath(
+    string $cachePath,
+    string $key,
+): string {
+    return $cachePath . '/' . hash('xxh128', $key) . '.cache';
+}
+
+/**
+ * Replace the payload of a signed cache file while keeping its original HMAC.
+ */
+function tamperWithCacheEntry(
+    string $filePath,
+    mixed $value,
+): void {
+    $envelope = file_get_contents($filePath);
+    $planted = serialize(['value' => $value, 'expires_at' => null, 'created_at' => 0]);
+
+    file_put_contents($filePath, substr($envelope, 0, 65) . $planted);
+}
+
+it('signs every cache entry it writes with an HMAC envelope', function (): void {
+    $this->driver->set('key', 'value');
+
+    $contents = file_get_contents(cacheEntryPath($this->cachePath, 'key'));
+
+    expect($contents)->toMatch('/\A[0-9a-f]{64}\./')
+        ->and($this->signer->unwrap($contents))->toBe(serialize([
+            'value' => 'value',
+            'expires_at' => $this->clock->now()->getTimestamp() + 3600,
+            'created_at' => $this->clock->now()->getTimestamp(),
+        ]));
+});
+
+it('round-trips a signed value through set and get', function (): void {
+    $this->driver->set('key', ['nested' => 'value']);
+
+    expect($this->driver->get('key'))->toBe(['nested' => 'value'])
+        ->and($this->driver->getItem('key')->isHit())->toBeTrue();
+});
+
+it('treats a tampered cache file as a miss and deletes it', function (): void {
+    $this->driver->set('key', 'value');
+    $filePath = cacheEntryPath($this->cachePath, 'key');
+
+    tamperWithCacheEntry($filePath, new stdClass());
+
+    expect($this->driver->get('key', 'default'))->toBe('default')
+        ->and(file_exists($filePath))->toBeFalse();
+});
+
+it('treats an unsigned legacy cache file as a miss and deletes it', function (): void {
+    mkdir($this->cachePath, 0755, true);
+    $filePath = cacheEntryPath($this->cachePath, 'key');
+
+    file_put_contents($filePath, serialize(['value' => new stdClass(), 'expires_at' => null, 'created_at' => 0]));
+
+    expect($this->driver->getItem('key')->isHit())->toBeFalse()
+        ->and(file_exists($filePath))->toBeFalse();
+});
+
+it('reports a tampered cache file as missing from has()', function (): void {
+    $this->driver->set('key', 'value');
+    tamperWithCacheEntry(cacheEntryPath($this->cachePath, 'key'), 'planted');
+
+    expect($this->driver->has('key'))->toBeFalse();
+});
+
+it('treats a cache file signed with a different key as a miss', function (): void {
+    $otherDriver = new FileCacheDriver($this->config, $this->clock, createTestCacheSigner('some-other-key'));
+    $otherDriver->set('key', 'value');
+
+    expect($this->driver->get('key'))->toBeNull();
+});
+
+it('resets the counter when incrementing a tampered cache file', function (): void {
+    $this->driver->increment('counter', 60);
+    $this->driver->increment('counter', 60);
+    $filePath = cacheEntryPath($this->cachePath, 'counter');
+
+    tamperWithCacheEntry($filePath, 1000);
+
+    expect($this->driver->increment('counter', 60))->toBe(1)
+        ->and($this->signer->unwrap(file_get_contents($filePath)))->not->toBeNull()
+        ->and($this->driver->get('counter'))->toBe(1);
+});
+
+it('resets the counter when incrementing an unsigned legacy cache file', function (): void {
+    mkdir($this->cachePath, 0755, true);
+    file_put_contents(
+        cacheEntryPath($this->cachePath, 'counter'),
+        serialize(['value' => 41, 'expires_at' => null, 'created_at' => 0]),
+    );
+
+    expect($this->driver->increment('counter', 60))->toBe(1);
+});
+
+it('throws TamperedCacheValueException on write when no signing key is configured', function (): void {
+    $driver = new FileCacheDriver($this->config, $this->clock, createTestCacheSigner(''));
+
+    expect(fn () => $driver->set('key', 'value'))
+        ->toThrow(TamperedCacheValueException::class, 'the encryption key is empty')
+        ->and(fn () => $driver->increment('counter', 60))
+        ->toThrow(TamperedCacheValueException::class, 'the encryption key is empty');
+});
+
+it('throws TamperedCacheValueException on read when no signing key is configured', function (): void {
+    $this->driver->set('key', 'value');
+    $driver = new FileCacheDriver($this->config, $this->clock, createTestCacheSigner(''));
+
+    expect(fn () => $driver->get('key'))
+        ->toThrow(TamperedCacheValueException::class, 'the encryption key is empty')
+        ->and(file_exists(cacheEntryPath($this->cachePath, 'key')))->toBeTrue();
 });

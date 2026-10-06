@@ -9,7 +9,9 @@ use Marko\Cache\Config\CacheConfig;
 use Marko\Cache\Contracts\CacheInterface;
 use Marko\Cache\Contracts\CacheItemInterface;
 use Marko\Cache\Exceptions\InvalidKeyException;
+use Marko\Cache\Exceptions\TamperedCacheValueException;
 use Marko\Cache\File\Exceptions\FileCacheException;
+use Marko\Cache\Signer\CacheValueSigner;
 use Marko\Core\Support\ErrorCapture;
 use Psr\Clock\ClockInterface;
 
@@ -18,10 +20,11 @@ readonly class FileCacheDriver implements CacheInterface
     public function __construct(
         private CacheConfig $config,
         private ClockInterface $clock,
+        private CacheValueSigner $cacheValueSigner,
     ) {}
 
     /**
-     * @throws InvalidKeyException
+     * @throws InvalidKeyException|TamperedCacheValueException
      */
     public function get(
         string $key,
@@ -45,7 +48,7 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * @throws InvalidKeyException|FileCacheException
+     * @throws InvalidKeyException|FileCacheException|TamperedCacheValueException
      */
     public function set(
         string $key,
@@ -70,7 +73,7 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * @throws InvalidKeyException
+     * @throws InvalidKeyException|TamperedCacheValueException
      */
     public function has(
         string $key,
@@ -139,7 +142,7 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * @throws InvalidKeyException
+     * @throws InvalidKeyException|TamperedCacheValueException
      */
     public function getItem(
         string $key,
@@ -166,7 +169,7 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * @throws InvalidKeyException
+     * @throws InvalidKeyException|TamperedCacheValueException
      */
     public function getMultiple(
         array $keys,
@@ -182,7 +185,7 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * @throws InvalidKeyException|FileCacheException
+     * @throws InvalidKeyException|FileCacheException|TamperedCacheValueException
      */
     public function setMultiple(
         array $values,
@@ -217,7 +220,7 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * @throws InvalidKeyException|FileCacheException
+     * @throws InvalidKeyException|FileCacheException|TamperedCacheValueException
      */
     public function increment(
         string $key,
@@ -235,31 +238,38 @@ readonly class FileCacheDriver implements CacheInterface
 
         flock($fh, LOCK_EX);
 
-        $content = stream_get_contents($fh);
-        $data = $content !== '' && $content !== false ? unserialize($content) : null;
-        $now = $this->clock->now()->getTimestamp();
+        try {
+            $content = stream_get_contents($fh);
+            // An unsigned or tampered entry is never unserialized; the counter restarts.
+            $serialized = $content !== '' && $content !== false ? $this->cacheValueSigner->unwrap($content) : null;
+            $data = $serialized !== null ? unserialize($serialized) : null;
+            $now = $this->clock->now()->getTimestamp();
 
-        if (!is_array($data)
-            || !array_key_exists('value', $data)
-            || !isset($data['created_at'])
-            || ($data['expires_at'] !== null && $now > $data['expires_at'])
-        ) {
-            $newValue = 1;
-            $data = [
-                'value' => $newValue,
-                'expires_at' => $ttl > 0 ? $now + $ttl : null,
-                'created_at' => $now,
-            ];
-        } else {
-            $newValue = (int) $data['value'] + 1;
-            $data['value'] = $newValue;
+            if (!is_array($data)
+                || !array_key_exists('value', $data)
+                || !isset($data['created_at'])
+                || ($data['expires_at'] !== null && $now > $data['expires_at'])
+            ) {
+                $newValue = 1;
+                $data = [
+                    'value' => $newValue,
+                    'expires_at' => $ttl > 0 ? $now + $ttl : null,
+                    'created_at' => $now,
+                ];
+            } else {
+                $newValue = (int) $data['value'] + 1;
+                $data['value'] = $newValue;
+            }
+
+            $envelope = $this->cacheValueSigner->wrap(serialize($data));
+
+            ftruncate($fh, 0);
+            rewind($fh);
+            fwrite($fh, $envelope);
+        } finally {
+            flock($fh, LOCK_UN);
+            fclose($fh);
         }
-
-        ftruncate($fh, 0);
-        rewind($fh);
-        fwrite($fh, serialize($data));
-        flock($fh, LOCK_UN);
-        fclose($fh);
 
         return $newValue;
     }
@@ -292,7 +302,13 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
+     * Read and verify a cache entry. An entry whose HMAC does not verify (tampered,
+     * corrupted, or written before entries were signed) is a miss and is deleted,
+     * so a planted file can never reach unserialize().
+     *
      * @return array{value: mixed, expires_at: ?int, created_at: int}|null
+     *
+     * @throws TamperedCacheValueException when no signing key is configured
      */
     private function read(
         string $key,
@@ -309,7 +325,15 @@ readonly class FileCacheDriver implements CacheInterface
             return null;
         }
 
-        $data = unserialize($content);
+        $serialized = $this->cacheValueSigner->unwrap($content);
+
+        if ($serialized === null) {
+            @unlink($filePath);
+
+            return null;
+        }
+
+        $data = unserialize($serialized);
 
         if (!is_array($data) || !array_key_exists('value', $data) || !isset($data['created_at'])) {
             return null;
@@ -321,7 +345,7 @@ readonly class FileCacheDriver implements CacheInterface
     /**
      * @param array{value: mixed, expires_at: ?int, created_at: int} $data
      *
-     * @throws FileCacheException
+     * @throws FileCacheException|TamperedCacheValueException
      */
     private function write(
         string $key,
@@ -330,7 +354,7 @@ readonly class FileCacheDriver implements CacheInterface
         $filePath = $this->getFilePath($key);
         $tempPath = $filePath . '.tmp.' . uniqid();
 
-        $serialized = serialize($data);
+        $serialized = $this->cacheValueSigner->wrap(serialize($data));
 
         $written = ErrorCapture::run($reason, fn (): int|false => file_put_contents($tempPath, $serialized, LOCK_EX));
 
