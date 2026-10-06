@@ -241,7 +241,9 @@ readonly class FileCacheDriver implements CacheInterface
         try {
             $content = stream_get_contents($fh);
             // An unsigned or tampered entry is never unserialized; the counter restarts.
-            $serialized = $content !== '' && $content !== false ? $this->cacheValueSigner->unwrap($content) : null;
+            $serialized = $content !== '' && $content !== false
+                ? $this->cacheValueSigner->unwrap($content, $key)
+                : null;
             $data = $serialized !== null ? unserialize($serialized) : null;
             $now = $this->clock->now()->getTimestamp();
 
@@ -261,7 +263,7 @@ readonly class FileCacheDriver implements CacheInterface
                 $data['value'] = $newValue;
             }
 
-            $envelope = $this->cacheValueSigner->wrap(serialize($data));
+            $envelope = $this->cacheValueSigner->wrap(serialize($data), $key);
 
             ftruncate($fh, 0);
             rewind($fh);
@@ -302,9 +304,10 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * Read and verify a cache entry. An entry whose HMAC does not verify (tampered,
-     * corrupted, or written before entries were signed) is a miss and is deleted,
-     * so a planted file can never reach unserialize().
+     * Read and verify a cache entry. The HMAC is bound to the cache key, so an entry
+     * whose HMAC does not verify (tampered, corrupted, copied from another key's file,
+     * or signed by an older release) is a miss and is deleted, so a planted file can
+     * never reach unserialize().
      *
      * @return array{value: mixed, expires_at: ?int, created_at: int}|null
      *
@@ -325,7 +328,7 @@ readonly class FileCacheDriver implements CacheInterface
             return null;
         }
 
-        $serialized = $this->cacheValueSigner->unwrap($content);
+        $serialized = $this->cacheValueSigner->unwrap($content, $key);
 
         if ($serialized === null) {
             @unlink($filePath);
@@ -354,7 +357,7 @@ readonly class FileCacheDriver implements CacheInterface
         $filePath = $this->getFilePath($key);
         $tempPath = $filePath . '.tmp.' . uniqid();
 
-        $serialized = $this->cacheValueSigner->wrap(serialize($data));
+        $serialized = $this->cacheValueSigner->wrap(serialize($data), $key);
 
         $written = ErrorCapture::run($reason, fn (): int|false => file_put_contents($tempPath, $serialized, LOCK_EX));
 
