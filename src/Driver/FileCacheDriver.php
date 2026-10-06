@@ -9,8 +9,9 @@ use Marko\Cache\Config\CacheConfig;
 use Marko\Cache\Contracts\CacheInterface;
 use Marko\Cache\Contracts\CacheItemInterface;
 use Marko\Cache\Exceptions\InvalidKeyException;
+use Marko\Cache\File\Exceptions\FileCacheException;
+use Marko\Core\Support\ErrorCapture;
 use Psr\Clock\ClockInterface;
-use RuntimeException;
 
 readonly class FileCacheDriver implements CacheInterface
 {
@@ -44,7 +45,7 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * @throws InvalidKeyException|RuntimeException
+     * @throws InvalidKeyException|FileCacheException
      */
     public function set(
         string $key,
@@ -63,7 +64,9 @@ readonly class FileCacheDriver implements CacheInterface
             'created_at' => $now,
         ];
 
-        return $this->write($key, $data);
+        $this->write($key, $data);
+
+        return true;
     }
 
     /**
@@ -179,7 +182,7 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * @throws InvalidKeyException
+     * @throws InvalidKeyException|FileCacheException
      */
     public function setMultiple(
         array $values,
@@ -214,7 +217,7 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * @throws InvalidKeyException|RuntimeException
+     * @throws InvalidKeyException|FileCacheException
      */
     public function increment(
         string $key,
@@ -317,27 +320,29 @@ readonly class FileCacheDriver implements CacheInterface
 
     /**
      * @param array{value: mixed, expires_at: ?int, created_at: int} $data
+     *
+     * @throws FileCacheException
      */
     private function write(
         string $key,
         array $data,
-    ): bool {
+    ): void {
         $filePath = $this->getFilePath($key);
         $tempPath = $filePath . '.tmp.' . uniqid();
 
         $serialized = serialize($data);
 
-        if (file_put_contents($tempPath, $serialized, LOCK_EX) === false) {
-            return false;
+        $written = ErrorCapture::run($reason, fn (): int|false => file_put_contents($tempPath, $serialized, LOCK_EX));
+
+        if ($written === false) {
+            throw FileCacheException::writeFailed($filePath, $reason);
         }
 
-        if (!@rename($tempPath, $filePath)) {
+        if (!ErrorCapture::run($reason, fn (): bool => rename($tempPath, $filePath))) {
             @unlink($tempPath);
 
-            return false;
+            throw FileCacheException::writeFailed($filePath, $reason);
         }
-
-        return true;
     }
 
     /**
@@ -354,16 +359,22 @@ readonly class FileCacheDriver implements CacheInterface
     }
 
     /**
-     * @throws RuntimeException
+     * Creates the cache directory only when it is missing, so the common case
+     * (it already exists) never calls mkdir(). A concurrent creator winning the
+     * race is fine: mkdir() fails but the directory then exists.
+     *
+     * @throws FileCacheException
      */
     private function ensureDirectoryExists(): void
     {
-        @mkdir($this->config->path(), 0755, recursive: true);
+        $path = $this->config->path();
 
-        if (!is_dir($this->config->path())) {
-            throw new RuntimeException(
-                'Cache directory could not be created: ' . $this->config->path(),
-            );
+        if (is_dir($path)) {
+            return;
+        }
+
+        if (!ErrorCapture::run($reason, fn (): bool => mkdir($path, 0755, recursive: true)) && !is_dir($path)) {
+            throw FileCacheException::directoryNotCreatable($path, $reason);
         }
     }
 }

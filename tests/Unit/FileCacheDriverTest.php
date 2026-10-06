@@ -5,8 +5,10 @@ declare(strict_types=1);
 use Marko\Cache\Config\CacheConfig;
 use Marko\Cache\Contracts\CacheInterface;
 use Marko\Cache\Contracts\CacheItemInterface;
+use Marko\Cache\Exceptions\CacheException;
 use Marko\Cache\Exceptions\InvalidKeyException;
 use Marko\Cache\File\Driver\FileCacheDriver;
+use Marko\Cache\File\Exceptions\FileCacheException;
 use Marko\Testing\Fake\FakeClock;
 use Marko\Testing\Fake\FakeConfigRepository;
 
@@ -398,24 +400,32 @@ it('treats a file cache entry that decodes to an unexpected shape as a miss', fu
         ->and($this->driver->has('key'))->toBeFalse();
 });
 
-it('leaves no orphan tmp file when the rename step fails', function (): void {
-    mkdir($this->cachePath, 0755, true);
+it(
+    'throws FileCacheException with the rename reason and leaves no orphan tmp file when the rename step fails',
+    function (): void {
+        mkdir($this->cachePath, 0755, true);
 
-    $key = 'orphan-test-key';
-    $hash = hash('xxh128', $key);
-    $targetPath = $this->cachePath . '/' . $hash . '.cache';
+        $key = 'orphan-test-key';
+        $hash = hash('xxh128', $key);
+        $targetPath = $this->cachePath . '/' . $hash . '.cache';
 
-    // Make the target path a directory so rename() fails
-    mkdir($targetPath, 0755, true);
+        // Make the target path a directory so rename() fails
+        mkdir($targetPath, 0755, true);
 
-    $result = $this->driver->set($key, 'some-value');
+        try {
+            $this->driver->set($key, 'some-value');
+            $this->fail('Expected FileCacheException');
+        } catch (FileCacheException $e) {
+            expect($e->getMessage())->toBe("Cache entry could not be written: $targetPath")
+                ->and($e->getContext())->toContain('rename(');
+        } finally {
+            // Cleanup the directory we created as the "target"
+            rmdir($targetPath);
+        }
 
-    expect($result)->toBeFalse()
-        ->and(glob($this->cachePath . '/*.tmp.*'))->toBeEmpty();
-
-    // Cleanup the directory we created as the "target"
-    rmdir($targetPath);
-});
+        expect(glob($this->cachePath . '/*.tmp.*'))->toBeEmpty();
+    },
+);
 
 it('removes leftover tmp files when clear is called', function (): void {
     mkdir($this->cachePath, 0755, true);
@@ -442,10 +452,43 @@ it('does not error when the cache directory already exists', function (): void {
     // Pre-create the directory (simulates a concurrent creator winning the race)
     mkdir($this->cachePath, 0755, true);
 
-    // set() calls ensureDirectoryExists() — must not throw or warn
-    $result = $this->driver->set('key', 'value');
+    // set() and setMultiple() call ensureDirectoryExists() — must not throw, and
+    // must not call mkdir() (which raises "File exists", even when suppressed)
+    $warnings = [];
+    set_error_handler(function (int $errno, string $message) use (&$warnings): bool {
+        $warnings[] = $message;
 
-    expect($result)->toBeTrue();
+        return true;
+    });
+
+    try {
+        $result = $this->driver->set('key', 'value');
+        $this->driver->set('key', 'again');
+        $this->driver->setMultiple(['a' => 1, 'b' => 2]);
+    } finally {
+        restore_error_handler();
+    }
+
+    expect($result)->toBeTrue()
+        ->and($warnings)->toBeEmpty();
+});
+
+it('throws FileCacheException with the OS reason when the cache directory cannot be created', function (): void {
+    // A regular file where a parent directory should be makes mkdir() fail
+    mkdir($this->cachePath, 0755, true);
+    $blocker = $this->cachePath . '/not-a-directory';
+    file_put_contents($blocker, 'x');
+
+    $driver = new FileCacheDriver(createTestCacheConfig($blocker . '/cache'), $this->clock);
+
+    try {
+        $driver->set('key', 'value');
+        $this->fail('Expected FileCacheException');
+    } catch (FileCacheException $e) {
+        expect($e)->toBeInstanceOf(CacheException::class)
+            ->and($e->getMessage())->toBe("Cache directory could not be created: $blocker/cache")
+            ->and($e->getContext())->toContain('mkdir(): Not a directory');
+    }
 });
 
 it('creates the cache directory when it is missing', function (): void {
