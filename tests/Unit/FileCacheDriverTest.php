@@ -7,6 +7,7 @@ use Marko\Cache\Contracts\CacheInterface;
 use Marko\Cache\Contracts\CacheItemInterface;
 use Marko\Cache\Exceptions\InvalidKeyException;
 use Marko\Cache\File\Driver\FileCacheDriver;
+use Marko\Testing\Fake\FakeClock;
 use Marko\Testing\Fake\FakeConfigRepository;
 
 function getCacheTestPath(): string
@@ -42,12 +43,13 @@ function createTestCacheConfig(
 }
 
 /**
- * Write a cache entry with a past expiration timestamp.
+ * Write a cache entry that expired 10 seconds before the given time.
  */
 function writeExpiredCacheEntry(
     string $cachePath,
     string $key,
     mixed $value,
+    int $now,
 ): void {
     if (!is_dir($cachePath)) {
         mkdir($cachePath, 0755, true);
@@ -58,8 +60,8 @@ function writeExpiredCacheEntry(
 
     $data = [
         'value' => $value,
-        'expires_at' => time() - 10,  // Expired 10 seconds ago
-        'created_at' => time() - 20,
+        'expires_at' => $now - 10,
+        'created_at' => $now - 20,
     ];
 
     file_put_contents($filePath, serialize($data));
@@ -68,7 +70,8 @@ function writeExpiredCacheEntry(
 beforeEach(function (): void {
     $this->cachePath = getCacheTestPath();
     $this->config = createTestCacheConfig($this->cachePath);
-    $this->driver = new FileCacheDriver($this->config);
+    $this->clock = new FakeClock('2026-01-01 12:00:00 UTC');
+    $this->driver = new FileCacheDriver($this->config, $this->clock);
 });
 
 afterEach(function (): void {
@@ -173,7 +176,7 @@ it('returns true when clearing empty cache', function (): void {
 });
 
 it('expires items after ttl', function (): void {
-    writeExpiredCacheEntry($this->cachePath, 'key', 'value');
+    writeExpiredCacheEntry($this->cachePath, 'key', 'value', $this->clock->now()->getTimestamp());
 
     expect($this->driver->get('key'))->toBeNull();
 });
@@ -186,10 +189,14 @@ it('does not expire items with zero ttl', function (): void {
 
 it('uses default ttl when not specified', function (): void {
     $cachePath = getCacheTestPath();
-    $config = createTestCacheConfig($cachePath, 1);
-    $driver = new FileCacheDriver($config);
-    writeExpiredCacheEntry($cachePath, 'key', 'value');
+    $config = createTestCacheConfig($cachePath, 30);
+    $driver = new FileCacheDriver($config, $this->clock);
+    $driver->set('key', 'value');
 
+    $this->clock->travel('+30 seconds');
+    expect($driver->get('key'))->toBe('value');
+
+    $this->clock->travel('+1 second');
     expect($driver->get('key'))->toBeNull();
 
     cleanupCacheTestPath($cachePath);
@@ -284,7 +291,7 @@ it('throws exception for key with invalid characters', function (): void {
 it('creates cache directory if not exists', function (): void {
     $newPath = sys_get_temp_dir() . '/marko-cache-new-' . bin2hex(random_bytes(8));
     $config = createTestCacheConfig($newPath);
-    $driver = new FileCacheDriver($config);
+    $driver = new FileCacheDriver($config, $this->clock);
 
     $driver->set('key', 'value');
 
@@ -303,13 +310,13 @@ it('handles concurrent access safely', function (): void {
 });
 
 it('removes expired item on has check', function (): void {
-    writeExpiredCacheEntry($this->cachePath, 'key', 'value');
+    writeExpiredCacheEntry($this->cachePath, 'key', 'value', $this->clock->now()->getTimestamp());
 
     expect($this->driver->has('key'))->toBeFalse();
 });
 
 it('removes expired item on getItem', function (): void {
-    writeExpiredCacheEntry($this->cachePath, 'key', 'value');
+    writeExpiredCacheEntry($this->cachePath, 'key', 'value', $this->clock->now()->getTimestamp());
 
     $item = $this->driver->getItem('key');
 
@@ -458,4 +465,73 @@ it('writes and reads back a value successfully after directory creation', functi
     $this->driver->set('greeting', 'hello');
 
     expect($this->driver->get('greeting'))->toBe('hello');
+});
+
+/**
+ * @return array{value: mixed, expires_at: ?int, created_at: int}
+ */
+function readCacheFileEntry(
+    string $cachePath,
+    string $key,
+): array {
+    return unserialize(file_get_contents($cachePath . '/' . hash('xxh128', $key) . '.cache'));
+}
+
+it('keeps an entry until its ttl has elapsed on the clock', function (): void {
+    $this->driver->set('key', 'value', 60);
+
+    $this->clock->travel('+60 seconds');
+
+    expect($this->driver->get('key'))->toBe('value')
+        ->and($this->driver->has('key'))->toBeTrue();
+});
+
+it('expires an entry one second after its ttl on the clock', function (): void {
+    $this->driver->set('key', 'value', 60);
+
+    $this->clock->travel('+61 seconds');
+
+    expect($this->driver->has('key'))->toBeFalse()
+        ->and($this->driver->get('key', 'default'))->toBe('default')
+        ->and($this->driver->getItem('key')->isHit())->toBeFalse();
+});
+
+it('records expires_at and created_at from the clock', function (): void {
+    $this->driver->set('key', 'value', 60);
+
+    $entry = readCacheFileEntry($this->cachePath, 'key');
+    $now = $this->clock->now()->getTimestamp();
+
+    expect($entry['created_at'])->toBe($now)
+        ->and($entry['expires_at'])->toBe($now + 60);
+});
+
+it('reports the item expiry relative to the clock', function (): void {
+    $this->driver->set('key', 'value', 90);
+
+    $expiresAt = $this->driver->getItem('key')->expiresAt();
+
+    expect($expiresAt)->not->toBeNull()
+        ->and($expiresAt->getTimestamp())->toBe($this->clock->now()->getTimestamp() + 90);
+});
+
+it('restarts an expired counter relative to the clock on increment', function (): void {
+    $this->driver->increment('counter', 60);
+    $this->driver->increment('counter', 60);
+
+    $this->clock->travel('+61 seconds');
+
+    expect($this->driver->increment('counter', 60))->toBe(1)
+        ->and(readCacheFileEntry($this->cachePath, 'counter')['expires_at'])
+        ->toBe($this->clock->now()->getTimestamp() + 60);
+});
+
+it('keeps counting within the window without moving the expiry', function (): void {
+    $this->driver->increment('counter', 60);
+    $expiresAt = readCacheFileEntry($this->cachePath, 'counter')['expires_at'];
+
+    $this->clock->travel('+60 seconds');
+
+    expect($this->driver->increment('counter', 60))->toBe(2)
+        ->and(readCacheFileEntry($this->cachePath, 'counter')['expires_at'])->toBe($expiresAt);
 });
